@@ -7,7 +7,6 @@ export class TruckScaleController {
 
   @Get('/peso-balanca')
   getWeight(): string {
-    console.log(process.env.TESTE);
     return this.truckScaleService.getWeight();
   }
 }
