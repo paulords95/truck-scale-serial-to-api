@@ -1,0 +1,124 @@
+const net = require('net');
+const EventEmitter = require('events');
+
+const DEFAULT_RECONNECT_INTERVAL = 3; // seconds
+const DEFAULT_TIMEOUT = 5; // seconds
+const SECOND = 1000; // ms
+
+//Source: https://github.com/AppliedMinds/tcp
+
+class Device extends EventEmitter {
+  constructor({
+    host,
+    port,
+    parser,
+    reconnectInterval = DEFAULT_RECONNECT_INTERVAL,
+    responseTimeout = DEFAULT_TIMEOUT,
+  }) {
+    super();
+    this.host = host;
+    this.port = port;
+    this.reconnectInterval = reconnectInterval;
+    this.responseTimeout = responseTimeout * SECOND;
+    this.connected = false;
+    this.userClose = false;
+    this.parser = parser;
+    this._dataEmitter = this.emit.bind(this, 'data');
+  }
+  async connect(reconnect = false) {
+    if (this.connected) return Promise.resolve();
+    this.userClose = false;
+    this.socket = new net.Socket();
+    this.socket.on('close', this.onDisconnect.bind(this));
+    this.socket.on('error', this.emit.bind(this, 'error'));
+    this.socket.on('timeout', this.onTimeout.bind(this, this.host, this.port));
+    this.socket.setKeepAlive(true);
+    this.socket.setTimeout(this.responseTimeout);
+    this.socket.setNoDelay();
+    this.dataPipe = this.socket;
+    if (this.parser)
+      this.dataPipe = this.dataPipe.pipe(this.parser, { end: false });
+    this.dataPipe.on('data', this._dataEmitter);
+
+    await new Promise((resolve) => {
+      clearTimeout(this._connectTimeout);
+      this._connectTimeout = setTimeout(
+        this.onTimeout.bind(this, this.host, this.port),
+        this.responseTimeout,
+      );
+      this.socket.on('connect', () => {
+        clearTimeout(this._connectTimeout);
+      });
+      if (!reconnect) this.connectResolver = resolve;
+      this.socket.connect(this.port, this.host, this.onConnect.bind(this));
+    });
+  }
+  async close() {
+    this.userClose = true;
+    clearTimeout(this._reconnectTimer);
+    if (this.socket) {
+      await new Promise((res) => this.socket.end(res));
+    }
+  }
+  get ip() {
+    console.warn(
+      'Device.ip has been deprecated. Please use Device.host instead.',
+    );
+    return this.host;
+  }
+  onConnect() {
+    if (this.connectResolver) this.connectResolver();
+    clearTimeout(this._reconnectTimer);
+    this.connected = true;
+    console.log(`Conectado a balanca - ${new Date().toLocaleString('pt-br')}`);
+    this.emit('connect');
+  }
+  onDisconnect() {
+    this.connected = false;
+    this.dataPipe.unpipe();
+    this.dataPipe.removeAllListeners();
+    clearTimeout(this._connectTimeout);
+    if (this.reconnectInterval > 0 && !this.userClose) {
+      this.emit(
+        'reconnect',
+        `Connection at at ${this.host}:${this.port} lost! Attempting reconnect in ${this.reconnectInterval} seconds...`,
+      );
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = setTimeout(
+        this.connect.bind(this, true),
+        this.reconnectInterval * SECOND,
+      );
+    }
+    this.emit('close');
+  }
+  onTimeout(host, port) {
+    this.emit('timeout');
+    this.socket.destroy(new Error(`Timeout connecting to ${host}:${port}`));
+  }
+  request(command, expectedResponse, errResponse) {
+    const receipt = new Promise((res, rej) => {
+      const receiver = (msg) => {
+        msg = msg.toString();
+        const success = msg.match(expectedResponse);
+        const failure = errResponse ? msg.match(errResponse) : false;
+        if (!success && !failure) return;
+        clearTimeout(timeout);
+        this.dataPipe.off('data', receiver);
+        if (failure) rej(failure);
+        else res(success);
+      };
+      const timeout = setTimeout(() => {
+        this.dataPipe.off('data', receiver);
+        rej(new Error('Timeout while waiting for response!'));
+      }, this.responseTimeout);
+      this.dataPipe.on('data', receiver);
+    });
+    this.send(command);
+    return receipt;
+  }
+  send(command) {
+    return new Promise((res) => this.socket.write(command, res));
+  }
+}
+
+export default Device;
